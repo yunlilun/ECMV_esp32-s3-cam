@@ -1,0 +1,1717 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <FS.h>
+#include <Preferences.h>
+#include <LittleFS.h>
+#include <SD_MMC.h>
+#include <NimBLEDevice.h>
+#include <usb/usb_host.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
+#include <esp_timer.h>
+
+// 摄像头引脚
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     15
+#define SIOD_GPIO_NUM      4
+#define SIOC_GPIO_NUM      5
+#define Y9_GPIO_NUM       16
+#define Y8_GPIO_NUM       17
+#define Y7_GPIO_NUM       18
+#define Y6_GPIO_NUM       12
+#define Y5_GPIO_NUM       10
+#define Y4_GPIO_NUM        8
+#define Y3_GPIO_NUM        9
+#define Y2_GPIO_NUM       11
+#define VSYNC_GPIO_NUM     6
+#define HREF_GPIO_NUM      7
+#define PCLK_GPIO_NUM     13
+
+// OTG 默认引脚
+#define OTG_DP_PIN 20
+#define OTG_DM_PIN 19
+
+WebServer server(80);
+Preferences prefs;
+camera_config_t camConfig;
+sensor_t *sensor = nullptr;
+
+// 运行时状态
+String apSSID = "ECMV";
+String apPass = "ecmv123456";
+String staSSID = "";
+String staPass = "";
+int currentRes = FRAMESIZE_SVGA;
+int currentQual = 12;
+int currentBri = 0;
+int currentCon = 0;
+int currentSat = 0;
+int currentWb = 0;
+int currentTheme = 0;
+int recSegmentSec = 30;
+bool recLoop = true;
+bool apEnabled = true;
+bool sdMounted = false;
+bool useSD = false;
+bool otgAsUsb = true;
+bool bleActive = false;
+bool recording = false;
+File recFile;
+uint32_t recFrames = 0;
+uint32_t recStartMs = 0;
+String recPath = "";
+
+// BLE 服务
+NimBLEServer *bleServer = nullptr;
+NimBLECharacteristic *bleCharRx = nullptr;
+NimBLECharacteristic *bleCharTx = nullptr;
+static bool bleConnected = false;
+String bleConnectScript = "";
+String bleDisconnectScript = "";
+String bleMacFilter = "";
+String usbConnectScript = "";
+String usbDisconnectScript = "";
+
+struct BleTriggerEvent {
+    bool connected;
+    char address[18];
+};
+
+QueueHandle_t bleTriggerQueue = nullptr;
+
+struct UsbTriggerEvent {
+    bool connected;
+    uint8_t address;
+    uint16_t vendorId;
+    uint16_t productId;
+    uint8_t deviceClass;
+    uint8_t deviceSubclass;
+    uint8_t deviceProtocol;
+};
+
+struct UsbDeviceRecord {
+    bool used;
+    usb_device_handle_t handle;
+    UsbTriggerEvent event;
+};
+
+static const size_t USB_DEVICE_LIMIT = 8;
+QueueHandle_t usbTriggerQueue = nullptr;
+usb_host_client_handle_t usbHostClient = nullptr;
+UsbDeviceRecord usbDevices[USB_DEVICE_LIMIT] = {};
+UsbTriggerEvent lastUsbEvent = {};
+uint8_t usbDeviceCount = 0;
+bool usbHostReady = false;
+String usbHostError = "";
+portMUX_TYPE usbStatusMux = portMUX_INITIALIZER_UNLOCKED;
+
+void queueBleTrigger(bool connected, NimBLEConnInfo &connInfo) {
+    if (!bleTriggerQueue) return;
+    BleTriggerEvent event = {};
+    event.connected = connected;
+    std::string address = connInfo.getAddress().toString();
+    snprintf(event.address, sizeof(event.address), "%s", address.c_str());
+    xQueueSend(bleTriggerQueue, &event, 0);
+}
+
+uint8_t getUsbInterfaceClass(const usb_config_desc_t *config, uint8_t *subclass, uint8_t *protocol) {
+    if (!config) return USB_CLASS_PER_INTERFACE;
+    int offset = 0;
+    const usb_standard_desc_t *current = (const usb_standard_desc_t *)config;
+    const usb_standard_desc_t *next;
+    while ((next = usb_parse_next_descriptor(current, config->wTotalLength, &offset)) != nullptr) {
+        current = next;
+        if (next->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE &&
+            next->bLength >= USB_INTF_DESC_SIZE) {
+            const usb_intf_desc_t *interfaceDesc = (const usb_intf_desc_t *)next;
+            *subclass = interfaceDesc->bInterfaceSubClass;
+            *protocol = interfaceDesc->bInterfaceProtocol;
+            return interfaceDesc->bInterfaceClass;
+        }
+    }
+    return USB_CLASS_PER_INTERFACE;
+}
+
+void usbClientEventCallback(const usb_host_client_event_msg_t *message, void *) {
+    if (!message || !usbHostClient) return;
+    if (message->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        size_t slot = USB_DEVICE_LIMIT;
+        for (size_t i = 0; i < USB_DEVICE_LIMIT; i++) {
+            if (!usbDevices[i].used) { slot = i; break; }
+        }
+        if (slot == USB_DEVICE_LIMIT) {
+            Serial.println("[usb] device limit reached");
+            return;
+        }
+
+        usb_device_handle_t handle = nullptr;
+        esp_err_t err = usb_host_device_open(usbHostClient, message->new_dev.address, &handle);
+        if (err != ESP_OK) {
+            Serial.printf("[usb] open failed: %s\n", esp_err_to_name(err));
+            return;
+        }
+        const usb_device_desc_t *descriptor = nullptr;
+        err = usb_host_get_device_descriptor(handle, &descriptor);
+        if (err != ESP_OK || !descriptor) {
+            Serial.printf("[usb] descriptor read failed: %s\n", esp_err_to_name(err));
+            usb_host_device_close(usbHostClient, handle);
+            return;
+        }
+
+        UsbTriggerEvent event = {};
+        event.connected = true;
+        event.address = message->new_dev.address;
+        event.vendorId = descriptor->idVendor;
+        event.productId = descriptor->idProduct;
+        event.deviceClass = descriptor->bDeviceClass;
+        event.deviceSubclass = descriptor->bDeviceSubClass;
+        event.deviceProtocol = descriptor->bDeviceProtocol;
+        if (event.deviceClass == USB_CLASS_PER_INTERFACE) {
+            const usb_config_desc_t *config = nullptr;
+            if (usb_host_get_active_config_descriptor(handle, &config) == ESP_OK && config) {
+                event.deviceClass = getUsbInterfaceClass(config, &event.deviceSubclass, &event.deviceProtocol);
+            }
+        }
+
+        usbDevices[slot].used = true;
+        usbDevices[slot].handle = handle;
+        usbDevices[slot].event = event;
+        portENTER_CRITICAL(&usbStatusMux);
+        lastUsbEvent = event;
+        if (usbDeviceCount < USB_DEVICE_LIMIT) usbDeviceCount++;
+        portEXIT_CRITICAL(&usbStatusMux);
+        if (usbTriggerQueue && xQueueSend(usbTriggerQueue, &event, 0) != pdTRUE) {
+            Serial.println("[usb] trigger queue full; connect script skipped");
+        }
+        Serial.printf("[usb] connected VID=%04X PID=%04X class=%02X\n",
+                      event.vendorId, event.productId, event.deviceClass);
+    } else if (message->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        for (size_t i = 0; i < USB_DEVICE_LIMIT; i++) {
+            if (!usbDevices[i].used || usbDevices[i].handle != message->dev_gone.dev_hdl) continue;
+            UsbTriggerEvent event = usbDevices[i].event;
+            event.connected = false;
+            portENTER_CRITICAL(&usbStatusMux);
+            lastUsbEvent = event;
+            if (usbDeviceCount > 0) usbDeviceCount--;
+            portEXIT_CRITICAL(&usbStatusMux);
+            usbDevices[i].used = false;
+            if (usbTriggerQueue && xQueueSend(usbTriggerQueue, &event, 0) != pdTRUE) {
+                Serial.println("[usb] trigger queue full; disconnect script skipped");
+            }
+            esp_err_t err = usb_host_device_close(usbHostClient, message->dev_gone.dev_hdl);
+            if (err != ESP_OK) Serial.printf("[usb] close failed: %s\n", esp_err_to_name(err));
+            Serial.printf("[usb] disconnected VID=%04X PID=%04X\n", event.vendorId, event.productId);
+            break;
+        }
+    }
+}
+
+void usbHostTask(void *) {
+    while (usbHostReady) {
+        uint32_t eventFlags = 0;
+        esp_err_t libErr = usb_host_lib_handle_events(pdMS_TO_TICKS(10), &eventFlags);
+        if (libErr != ESP_OK && libErr != ESP_ERR_TIMEOUT) {
+            Serial.printf("[usb] library event error: %s\n", esp_err_to_name(libErr));
+        }
+        if (usbHostClient) {
+            esp_err_t clientErr = usb_host_client_handle_events(usbHostClient, pdMS_TO_TICKS(10));
+            if (clientErr != ESP_OK && clientErr != ESP_ERR_TIMEOUT) {
+                Serial.printf("[usb] client event error: %s\n", esp_err_to_name(clientErr));
+            }
+        }
+    }
+    vTaskDelete(nullptr);
+}
+
+bool initUsbHost() {
+    usbTriggerQueue = xQueueCreate(USB_DEVICE_LIMIT, sizeof(UsbTriggerEvent));
+    if (!usbTriggerQueue) {
+        usbHostError = "USB 事件队列分配失败";
+        Serial.println("[usb] trigger queue allocation failed");
+        return false;
+    }
+    usb_host_config_t hostConfig = {};
+    hostConfig.skip_phy_setup = false;
+    hostConfig.root_port_unpowered = false;
+    hostConfig.intr_flags = ESP_INTR_FLAG_LEVEL1;
+    esp_err_t err = usb_host_install(&hostConfig);
+    if (err != ESP_OK) {
+        usbHostError = String("USB Host 启动失败: ") + esp_err_to_name(err);
+        Serial.printf("[usb] install failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
+    usb_host_client_config_t clientConfig = {};
+    clientConfig.is_synchronous = false;
+    clientConfig.max_num_event_msg = USB_DEVICE_LIMIT;
+    clientConfig.async.client_event_callback = usbClientEventCallback;
+    clientConfig.async.callback_arg = nullptr;
+    err = usb_host_client_register(&clientConfig, &usbHostClient);
+    if (err != ESP_OK) {
+        usbHostError = String("USB 客户端注册失败: ") + esp_err_to_name(err);
+        Serial.printf("[usb] client registration failed: %s\n", esp_err_to_name(err));
+        usb_host_uninstall();
+        return false;
+    }
+    usbHostReady = true;
+    if (xTaskCreate(usbHostTask, "usb_host", 6144, nullptr, 5, nullptr) != pdPASS) {
+        usbHostReady = false;
+        usb_host_client_deregister(usbHostClient);
+        usbHostClient = nullptr;
+        usb_host_uninstall();
+        usbHostError = "USB 事件任务创建失败";
+        Serial.println("[usb] event task creation failed");
+        return false;
+    }
+    usbHostError = "";
+    Serial.println("[usb] host enumeration ready");
+    return true;
+}
+
+String jsonEscape(const String &s);
+
+class BleRxCallback : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &) override {
+        String v = c->getValue().c_str();
+        v.trim();
+        if (v.length() < 5) return;
+        int sp = v.indexOf("\"ssid\":\"");
+        if (sp < 0) return;
+        int s = sp + 8, e = v.indexOf('"', s);
+        if (e < 0) return;
+        String ssid = v.substring(s, e);
+        String pass = "";
+        int pp = v.indexOf("\"pass\":\"");
+        if (pp >= 0) { s = pp + 8; e = v.indexOf('"', s); if (e > s) pass = v.substring(s, e); }
+        staSSID = ssid; staPass = pass;
+        prefs.putString("staSSID", staSSID); prefs.putString("staPass", staPass);
+        WiFi.begin(staSSID.c_str(), staPass.c_str());
+        if (bleCharTx) {
+            String rsp = "{\"status\":\"connecting\",\"ssid\":\"" + jsonEscape(ssid) + "\"}";
+            bleCharTx->setValue(rsp.c_str());
+            bleCharTx->notify();
+        }
+    }
+};
+
+class BleConnCallback : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer *, NimBLEConnInfo &connInfo) override {
+        bleConnected = true;
+        queueBleTrigger(true, connInfo);
+    }
+    void onDisconnect(NimBLEServer *, NimBLEConnInfo &connInfo, int) override {
+        bleConnected = false;
+        queueBleTrigger(false, connInfo);
+    }
+};
+
+static BleRxCallback bleRxCallback;
+static BleConnCallback bleConnCallback;
+
+// 简易脚本存储
+#define SCRIPT_MAX 2048
+char scriptBuf[SCRIPT_MAX] = "";
+
+// 内嵌前端
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ECMV</title>
+<style>
+:root{--bg:#000;--fg:#fff;--accent:#00e5ff;--card:#111;--border:#333;}
+[data-theme="tech"]{--bg:#020d02;--fg:#c8ffc8;--accent:#00ff66;--card:#061206;--border:#1a4d1a;}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,sans-serif;overflow:hidden;height:100vh;width:100vw}
+#monitor{position:relative;width:100%;height:100%;background:#000;display:flex;align-items:center;justify-content:center}
+#stream{width:100%;height:100%;object-fit:contain}
+#hud-tl{position:absolute;top:8px;left:8px;font-size:11px;background:rgba(0,0,0,.55);padding:6px 9px;border-radius:6px;line-height:1.5;pointer-events:none;z-index:5}
+#hud-tl b{color:var(--accent)}
+#btn-settings{position:absolute;top:8px;right:8px;z-index:10;background:rgba(0,0,0,.6);border:1px solid var(--border);color:var(--fg);width:40px;height:40px;border-radius:50%;font-size:20px;cursor:pointer}
+#hud-br{position:absolute;bottom:14px;right:12px;z-index:10;display:flex;gap:10px}
+#hud-br button{width:58px;height:58px;border-radius:50%;border:2px solid var(--accent);background:rgba(0,0,0,.65);color:var(--accent);font-size:11px;font-weight:700;cursor:pointer}
+#hud-br button.rec-on{background:#ff3b30;border-color:#ff3b30;color:#fff}
+#panel{position:fixed;inset:0;background:var(--bg);z-index:100;display:none;flex-direction:column;overflow:hidden}
+#panel.open{display:flex}
+#panel header{display:flex;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);background:var(--card);gap:8px}
+#panel header h2{font-size:16px;flex:1;color:var(--accent)}
+#panel header button{background:transparent;border:1px solid var(--border);color:var(--fg);padding:7px 12px;border-radius:6px;font-size:13px;cursor:pointer}
+#tabs{display:flex;overflow-x:auto;background:var(--card);border-bottom:1px solid var(--border);flex-shrink:0}
+#tabs button{flex:1 0 auto;padding:11px 12px;background:transparent;border:none;color:var(--fg);opacity:.55;font-size:12px;cursor:pointer;white-space:nowrap;border-bottom:2px solid transparent}
+#tabs button.active{opacity:1;border-bottom-color:var(--accent);color:var(--accent)}
+#tabbody{flex:1;overflow-y:auto;padding:12px}
+.tabpage{display:none}.tabpage.active{display:block}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:10px}
+.card h4{margin:0 0 10px;font-size:13px;color:var(--accent);font-weight:600}
+label{display:block;font-size:12px;opacity:.75;margin:8px 0 4px}
+input,select,textarea{width:100%;padding:9px 10px;background:#000;border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:13px;outline:none}
+textarea{min-height:100px;resize:vertical;font-family:monospace;font-size:12px}
+input[type=range]{padding:0;height:32px;border:none;background:transparent}
+.btnrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.btnrow button,.btn{flex:1;padding:10px;background:var(--accent);color:#000;border:none;border-radius:6px;font-weight:700;font-size:13px;cursor:pointer}
+.btn-ghost{background:transparent!important;color:var(--fg)!important;border:1px solid var(--border)!important}
+.btn-danger{background:#ff3b30!important;color:#fff!important}
+.row2{display:flex;gap:8px}.row2>*{flex:1}
+.fileitem{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px;gap:8px}
+.fileitem:last-child{border-bottom:none}
+.fileitem .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fileitem button{padding:6px 10px;font-size:11px;border-radius:5px;border:1px solid var(--border);background:transparent;color:var(--fg);cursor:pointer}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;background:rgba(0,229,255,.15);color:var(--accent);margin-left:6px}
+#toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:10px 18px;border-radius:20px;font-size:13px;z-index:999;opacity:0;transition:.25s;pointer-events:none;border:1px solid #444}
+#toast.show{opacity:1}
+#fileview{position:fixed;inset:0;background:#000;z-index:200;display:none;flex-direction:column}
+#fileview header{display:flex;justify-content:space-between;padding:10px 12px;background:#111;border-bottom:1px solid #333}
+#fileview .body{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto}
+#fileview img,#fileview video{max-width:100%;max-height:100%}
+</style>
+</head>
+<body>
+<div id="monitor">
+<img id="stream" src="/frame">
+<div id="hud-tl">
+<div><b>FPS</b> <span id="h-fps">--</span> | <b>T</b> <span id="h-temp">--</span>°C</div>
+<div><b>RAM</b> <span id="h-ram">--</span> | <b>WiFi</b> <span id="h-wifi">--</span></div>
+<div id="h-net" style="font-size:10px;opacity:.7"></div>
+</div>
+<button id="btn-settings" onclick="openPanel()">⚙</button>
+<div id="hud-br">
+<button onclick="snap()">SNAP</button>
+<button id="recBtn" onclick="toggleRec()">REC</button>
+</div>
+</div>
+
+<div id="panel">
+<header><h2>ECMV 设置中心</h2><button onclick="closePanel()">关闭</button></header>
+<div id="tabs">
+<button class="active" onclick="switchTab(0,this)">常规</button>
+<button onclick="switchTab(1,this)">网络与连接</button>
+<button onclick="switchTab(2,this)">摄像头与文件</button>
+<button onclick="switchTab(3,this)">OTG 与脚本</button>
+<button onclick="switchTab(4,this)">关于</button>
+</div>
+<div id="tabbody">
+
+<div class="tabpage active" id="tp0">
+<div class="card"><h4>画面与特效</h4>
+<label>分辨率</label>
+<select id="s-res">
+<option value="6">QVGA 320x240</option>
+<option value="8">CIF 400x296</option>
+<option value="9">HVGA 480x320</option>
+<option value="10">VGA 640x480</option>
+<option value="11">SVGA 800x600</option>
+<option value="12">XGA 1024x768</option>
+<option value="13">HD 1280x720</option>
+<option value="14">SXGA 1280x1024</option>
+<option value="15">UXGA 1600x1200</option>
+<option value="19">QXGA 2048x1536 (OV3660 3MP)</option>
+</select>
+<label>JPEG 画质 (10-63，越小越好)</label>
+<input type="range" id="s-qual" min="10" max="63" value="12">
+<label>UI 主题</label>
+<select id="s-theme">
+<option value="0">暗黑</option>
+<option value="1">科技绿</option>
+</select>
+<div class="btnrow"><button onclick="applyCam()">应用画面参数</button></div>
+</div>
+<div class="card"><h4>拍摄</h4>
+<div class="btnrow"><button onclick="snap()">立即拍摄并下载</button></div>
+<p style="font-size:11px;opacity:.6;margin-top:8px">拍摄下载到浏览器，不占用设备存储。</p>
+</div>
+<div class="card"><h4>录像</h4>
+<label>分段时长 (秒)</label>
+<input type="number" id="s-recseg" min="5" max="600" value="30">
+<label><input type="checkbox" id="s-recloop" checked> 循环覆盖</label>
+<div class="btnrow"><button onclick="applyRec()">保存录像设置</button></div>
+<p style="font-size:11px;opacity:.6;margin-top:8px">网页端 REC 为浏览器 MediaRecorder 录制；设备端“保存 MJPEG”在文件页操作。</p>
+</div>
+</div>
+
+<div class="tabpage" id="tp1">
+<div class="card"><h4>当前网络状态</h4>
+<div id="net-status" style="font-size:13px;line-height:1.8"></div>
+</div>
+<div class="card"><h4>热点 (AP) 设置</h4>
+<p style="font-size:12px;opacity:.7;margin-bottom:8px">设备启动后始终开启热点。可配置热点名称和密码。</p>
+<label>热点名称</label><input type="text" id="s-apssid" placeholder="ECMV">
+<label>热点密码 (至少 8 位)</label><input type="password" id="s-appass" placeholder="留空不修改">
+<div class="btnrow"><button onclick="applyAP()">保存热点设置</button></div>
+</div>
+<div class="card"><h4>WiFi 密码 / STA 连接</h4>
+<label>路由器 SSID</label><input type="text" id="s-stassid" placeholder="要连接的路由器名称">
+<label>路由器密码</label><input type="password" id="s-stapass" placeholder="留空不修改">
+<div class="btnrow"><button onclick="applySTA()">连接路由器</button></div>
+</div>
+<div class="card"><h4>BLE 蓝牙配网</h4>
+<p style="font-size:12px;opacity:.75;margin-bottom:8px">状态：<span id="ble-stat">未启动</span></p>
+<div class="btnrow">
+<button onclick="bleStart()">启动 BLE 广播</button>
+<button class="btn-ghost" onclick="bleStop()">停止 BLE</button>
+</div>
+<p style="font-size:11px;opacity:.6;margin-top:8px">使用 nRF Connect 等工具连接 ECMV-BLE，向 RX 特征写入 JSON：{"ssid":"MyWiFi","pass":"12345678"}</p>
+</div>
+<div class="card"><h4>BLE 连接触发脚本</h4>
+<label>设备 MAC 地址筛选（留空表示任意设备）</label>
+<input type="text" id="s-ble-mac" placeholder="AA:BB:CC:DD:EE:FF">
+<label>设备连接时</label>
+<textarea id="s-ble-connect" placeholder="GPIO=2:1&#10;DELAY=500&#10;GPIO=2:0"></textarea>
+<label>设备断开时</label>
+<textarea id="s-ble-disconnect" placeholder="GPIO=2:0"></textarea>
+<div class="btnrow"><button onclick="saveBleAutomation()">保存蓝牙触发脚本</button></div>
+<p style="font-size:11px;opacity:.6;margin-top:8px">触发脚本在主循环中执行；只支持 GPIO 和 DELAY 命令。筛选使用连接设备的 BLE 地址，随机地址可能无法长期匹配。</p>
+</div>
+</div>
+
+<div class="tabpage" id="tp2">
+<div class="card"><h4>摄像头传感器</h4>
+<label>亮度 (-2 ~ 2)</label><input type="range" id="s-bri" min="-2" max="2" value="0">
+<label>对比度 (-2 ~ 2)</label><input type="range" id="s-con" min="-2" max="2" value="0">
+<label>饱和度 (-2 ~ 2)</label><input type="range" id="s-sat" min="-2" max="2" value="0">
+<label>白平衡</label>
+<select id="s-wb">
+<option value="0">自动</option><option value="1">晴天</option><option value="2">阴天</option>
+<option value="3">办公室</option><option value="4">室内</option>
+</select>
+<div class="btnrow"><button onclick="applySensor()">应用传感器参数</button></div>
+</div>
+<div class="card"><h4>存储文件</h4>
+<label>新录像保存位置</label>
+<select id="s-storage">
+<option value="0">设备内置 Flash（LittleFS）</option>
+<option value="1">板载 microSD（SD_MMC）</option>
+</select>
+<p id="sd-info" style="font-size:11px;opacity:.65;margin-top:6px">GOOUUU v1.5 预设：CLK 39 / CMD 38 / D0 40（一位模式）</p>
+<div class="btnrow"><button onclick="saveStorage()">保存存储位置</button></div>
+<div id="filelist" style="max-height:300px;overflow-y:auto;margin-bottom:10px">加载中...</div>
+<div class="btnrow">
+<button class="btn-ghost" onclick="loadFiles()">刷新</button>
+<button class="btn-danger" onclick="deleteAll()">删除全部</button>
+</div>
+</div>
+<div class="card"><h4>设备端 MJPEG 录制</h4>
+<p style="font-size:12px;opacity:.75;margin-bottom:8px">将摄像头 JPEG 帧序列保存为 .mjpeg 文件，可在文件页下载。</p>
+<div class="btnrow">
+<button id="devRecBtn" onclick="toggleDevRec()">开始保存 MJPEG</button>
+</div>
+<p id="devRecStat" style="font-size:11px;margin-top:8px;opacity:.7"></p>
+</div>
+</div>
+
+<div class="tabpage" id="tp3">
+<div class="card"><h4>USB OTG 引脚</h4>
+<label>GPIO19 (D-) / GPIO20 (D+) 用途</label>
+<select id="s-otg">
+<option value="1">USB Host 设备检测</option>
+<option value="0">普通 GPIO (保留)</option>
+</select>
+<div class="btnrow"><button onclick="applyOTG()">保存 OTG 设置</button></div>
+<p style="font-size:11px;opacity:.6;margin-top:8px">Host 模式读取 USB 描述符并运行板上 GPIO 脚本；需要该接口确有 5V VBUS。不会向连接的手机/电脑发送按键或执行主机命令。</p>
+</div>
+<div class="card"><h4>USB Host 状态</h4><div id="usb-status" style="font-size:12px;line-height:1.8">读取中...</div></div>
+<div class="card"><h4>USB 插入/拔出脚本</h4>
+<label>检测到 USB 设备时（板上脚本）</label>
+<textarea id="s-usb-connect" placeholder="GPIO=2:1&#10;DELAY=500&#10;GPIO=2:0"></textarea>
+<label>USB 设备拔出时</label>
+<textarea id="s-usb-disconnect" placeholder="GPIO=2:0"></textarea>
+<div class="btnrow"><button onclick="saveUsbAutomation()">保存 USB 触发脚本</button></div>
+<p style="font-size:11px;opacity:.6;margin-top:8px">只支持 GPIO=引脚:0/1 和 DELAY=毫秒，不会操作 USB 设备本身。</p>
+</div>
+<div class="card"><h4>简易脚本引擎</h4>
+<label>脚本内容（每行：GPIO=引脚:电平 或 DELAY=毫秒）</label>
+<textarea id="s-script" placeholder="GPIO=2:1&#10;DELAY=500&#10;GPIO=2:0"></textarea>
+<div class="btnrow">
+<button onclick="saveScript()">保存脚本</button>
+<button class="btn-ghost" onclick="runScript()">执行脚本</button>
+</div>
+<p style="font-size:11px;opacity:.6;margin-top:8px">脚本允许 GPIO：1,2,3,14,21,41,42,47,48；摄像头、SD、USB、PSRAM 与串口引脚不可用。</p>
+</div>
+<div class="card"><h4>系统信息</h4>
+<div id="sys-info" style="font-size:12px;line-height:1.9"></div>
+</div>
+</div>
+
+<div class="tabpage" id="tp4">
+<div class="card"><h4>ECMV</h4>
+<p style="font-size:13px;line-height:1.8">ESP32 Camera Monitor & Video</p>
+<p style="font-size:12px;opacity:.7;line-height:1.8;margin-top:8px">单文件固件，集成摄像头监控、Web 文件管理、WiFi AP+STA、BLE 配网、OTG 配置与 MJPEG 保存。</p>
+</div>
+<div class="card"><h4>版本与芯片</h4>
+<div id="about-info" style="font-size:12px;line-height:1.9"></div>
+<p style="font-size:12px;margin-top:8px"><a href="https://github.com/yunlilun/ECMV_esp32-s3-cam" target="_blank" rel="noopener">GitHub 源码仓库</a></p>
+</div>
+</div>
+
+</div>
+</div>
+
+<div id="toast"></div>
+<div id="fileview">
+<header><span id="fv-name"></span><button onclick="closeFileView()">关闭</button></header>
+<div class="body" id="fv-body"></div>
+</div>
+
+<script>
+var $=function(id){return document.getElementById(id)};
+var stream=$('stream');
+var canvas=document.createElement('canvas');
+var ctx=canvas.getContext('2d');
+var isRec=false,recorder=null,chunks=[],drawTimer=null;
+var recStartedAt=0;
+var devRecTimer=null;
+var frameTimer=null;
+var frameDelay=100;
+
+var scheduleFrame=function(delay){
+ clearTimeout(frameTimer);
+ frameTimer=setTimeout(function(){
+  if(stream.isConnected)stream.src='/frame?t='+Date.now();
+ },document.hidden?1000:delay);
+}
+stream.onload=function(){scheduleFrame(frameDelay)};
+stream.onerror=function(){scheduleFrame(500)};
+
+var toast=function(m){var t=$('toast');t.textContent=m;t.classList.add('show');setTimeout(function(){t.classList.remove('show')},1800)}
+var api=function(p){return fetch(p).then(function(r){return r.json()})}
+var apiPost=function(p,b){return fetch(p,{method:'POST',body:JSON.stringify(b),headers:{'Content-Type':'application/json'}}).then(function(r){return r.json()})}
+
+var openPanel=function(){$('panel').classList.add('open');loadAll()}
+var closePanel=function(){$('panel').classList.remove('open')}
+var switchTab=function(i,el){
+ var ps=document.querySelectorAll('.tabpage');for(var k=0;k<ps.length;k++)ps[k].classList.remove('active');
+ var bs=$('tabs').children;for(var k=0;k<bs.length;k++)bs[k].classList.remove('active');
+ $('tp'+i).classList.add('active');el.classList.add('active');
+ if(i===1){loadNetStatus();loadBleAutomation()};if(i===2){loadFiles();loadSensor();loadStorage()};if(i===3)loadOTG();if(i===4)loadAbout();
+}
+
+var loadAll=function(){
+ api('/api/status').then(function(d){
+  $('s-res').value=d.res;$('s-qual').value=d.qual;$('s-theme').value=d.theme;
+  $('s-bri').value=d.bri;$('s-con').value=d.con;$('s-sat').value=d.sat;$('s-wb').value=d.wb;
+  $('s-recseg').value=d.recSeg;$('s-recloop').checked=d.recLoop;
+  $('s-apssid').value=d.apSSID;
+  $('s-otg').value=d.otgAsUsb?1:0;
+  document.documentElement.setAttribute('data-theme',d.theme===1?'tech':'');
+  loadNetStatus();loadScript();
+ });
+}
+
+var applyCam=function(){
+ apiPost('/api/cam',{res:+$('s-res').value,qual:+$('s-qual').value,theme:+$('s-theme').value,bri:+$('s-bri').value,con:+$('s-con').value,sat:+$('s-sat').value,wb:+$('s-wb').value})
+ .then(function(d){toast(d.msg||'已应用');document.documentElement.setAttribute('data-theme',+$('s-theme').value===1?'tech':'');stream.src='/frame?t='+Date.now()})
+}
+var applyRec=function(){apiPost('/api/rec',{seg:+$('s-recseg').value,loop:$('s-recloop').checked}).then(function(){toast('录像设置已保存')})}
+var applyAP=function(){
+ var pass=$('s-appass').value;
+ if(pass.length>0&&pass.length<8){toast('热点密码至少 8 位');return}
+ apiPost('/api/ap',{enabled:1,ssid:$('s-apssid').value,pass:pass}).then(function(d){toast(d.msg||'已保存，热点变更需重启');$('s-appass').value=''})
+}
+var applySTA=function(){
+ var ssid=$('s-stassid').value.trim();
+ if(!ssid){toast('请输入路由器 SSID');return}
+ apiPost('/api/sta',{ssid:ssid,pass:$('s-stapass').value}).then(function(d){toast(d.msg||'连接指令已发送');$('s-stapass').value='';setTimeout(loadNetStatus,3000)})
+}
+var applySensor=function(){
+ apiPost('/api/sensor',{bri:+$('s-bri').value,con:+$('s-con').value,sat:+$('s-sat').value,wb:+$('s-wb').value})
+ .then(function(d){toast(d.msg||'传感器参数已应用');stream.src='/frame?t='+Date.now()})
+}
+var applyOTG=function(){apiPost('/api/otg',{usb:+$('s-otg').value}).then(function(){toast('OTG 设置已保存，重启后生效')})}
+
+var loadNetStatus=function(){
+ api('/api/net').then(function(d){
+  var h='<div><b>AP</b> '+(d.apOn?'已开启':'已关闭')+' '+(d.apSSID||'')+'</div>';
+  h+='<div><b>STA</b> '+(d.staConnected?'已连接 '+d.staSSID+' | IP '+d.staIP+' | 信号 '+d.rssi+' dBm':'未连接')+'</div>';
+  h+='<div><b>AP IP</b> '+d.apIP+'</div>';
+  $('net-status').innerHTML=h;$('ble-stat').textContent=d.ble?'BLE 广播中':'未启动';
+ });
+}
+var bleStart=function(){apiPost('/api/ble',{on:1}).then(function(d){toast(d.msg);loadNetStatus()})}
+var bleStop=function(){apiPost('/api/ble',{on:0}).then(function(d){toast(d.msg);loadNetStatus()})}
+var loadBleAutomation=function(){
+ api('/api/ble-script').then(function(d){
+  $('s-ble-mac').value=d.mac||'';
+  $('s-ble-connect').value=d.connect||'';
+  $('s-ble-disconnect').value=d.disconnect||'';
+ });
+}
+var saveBleAutomation=function(){
+ apiPost('/api/ble-script',{mac:$('s-ble-mac').value.trim(),connect:$('s-ble-connect').value,disconnect:$('s-ble-disconnect').value})
+ .then(function(d){toast(d.msg||'蓝牙触发脚本已保存')});
+}
+
+var loadFiles=function(){
+ api('/api/files').then(function(d){
+  var el=$('filelist');
+  if(!d.files||!d.files.length){el.innerHTML='<p style="opacity:.5;font-size:12px">暂无文件</p>';return}
+  var h='';d.files.forEach(function(f){
+   h+='<div class="fileitem"><span class="nm">'+f.name+' <span style="opacity:.5">'+(f.size/1024).toFixed(1)+'KB</span></span>';
+   h+='<button onclick="viewFile(\''+f.name+'\')">预览</button>';
+   h+='<button onclick="downloadFile(\''+f.name+'\')">下载</button>';
+   h+='<button onclick="deleteFile(\''+f.name+'\')">删除</button></div>';
+  });
+  el.innerHTML=h;
+ });
+}
+var loadStorage=function(){
+ api('/api/storage').then(function(d){
+  $('s-storage').value=d.useSD?1:0;
+  $('sd-info').textContent=d.sdMounted
+   ?'板载 microSD 已挂载；GOOUUU v1.5 预设：CLK 39 / CMD 38 / D0 40（一位模式）'
+   :'未检测到 SD 卡；GOOUUU v1.5 预设：CLK 39 / CMD 38 / D0 40（一位模式）';
+ });
+}
+var saveStorage=function(){
+ apiPost('/api/storage',{useSD:+$('s-storage').value}).then(function(d){
+  toast(d.msg||'存储位置已保存');
+  if(d.ok)loadFiles();
+ });
+}
+var viewFile=function(n){$('fv-name').textContent=n;$('fileview').style.display='flex';var b=$('fv-body');
+ if(n.endsWith('.jpg')||n.endsWith('.jpeg'))b.innerHTML='<img src="/download?f='+encodeURIComponent(n)+'">';
+ else if(n.endsWith('.mjpeg'))b.innerHTML='<p style="font-size:13px;line-height:1.6">设备端 MJPEG 文件是连续 JPEG 帧序列，不是 WebM/AVI 容器，浏览器不能直接播放。可下载后用支持 MJPEG 的播放器处理。</p><a style="color:#0ef" href="/download?f='+encodeURIComponent(n)+'">下载 '+n+'</a>';
+ else if(n.endsWith('.avi'))b.innerHTML='<video controls src="/download?f='+encodeURIComponent(n)+'"></video>';
+ else b.innerHTML='<a style="color:#0ef" href="/download?f='+encodeURIComponent(n)+'">下载 '+n+'</a>';
+}
+var closeFileView=function(){$('fileview').style.display='none';$('fv-body').innerHTML=''}
+var downloadFile=function(n){location.href='/download?f='+encodeURIComponent(n)}
+var deleteFile=function(n){if(!confirm('删除 '+n+'?'))return;apiPost('/api/delete',{name:n}).then(function(){loadFiles()})}
+var deleteAll=function(){if(!confirm('删除全部文件？'))return;apiPost('/api/deleteall',{}).then(function(){loadFiles()})}
+
+var readEbmlVint=function(view,offset,isSize){
+ if(offset>=view.byteLength)return null;
+ var first=view.getUint8(offset),mask=0x80,length=1;
+ while(length<=8&&(first&mask)===0){mask>>=1;length++}
+ if(length>8||offset+length>view.byteLength)return null;
+ var value=isSize?(first&(mask-1)):first;
+ for(var i=1;i<length;i++)value=value*256+view.getUint8(offset+i);
+ var unknown=false;
+ if(isSize){
+  unknown=(first&(mask-1))===mask-1;
+  for(var i=1;i<length&&unknown;i++)if(view.getUint8(offset+i)!==255)unknown=false;
+ }
+ return {value:value,length:length,unknown:unknown};
+}
+var readEbmlElement=function(view,offset,limit){
+ var id=readEbmlVint(view,offset,false);
+ if(!id)return null;
+ var size=readEbmlVint(view,offset+id.length,true);
+ if(!size)return null;
+ var dataStart=offset+id.length+size.length;
+ var dataEnd=size.unknown?limit:dataStart+size.value;
+ if(dataEnd>limit||dataEnd<dataStart)return null;
+ return {id:id.value,dataStart:dataStart,dataEnd:dataEnd,next:dataEnd};
+}
+var patchWebmDuration=function(blob,durationMs){
+ if(!blob.arrayBuffer)return Promise.resolve({blob:blob,patched:false});
+ return blob.arrayBuffer().then(function(buffer){
+  var view=new DataView(buffer),segment=null,offset=0;
+  while(offset<view.byteLength){
+   var element=readEbmlElement(view,offset,view.byteLength);
+   if(!element)break;
+   if(element.id===0x18538067){segment=element;break}
+   if(element.next<=offset)break;
+   offset=element.next;
+  }
+  if(!segment)return {blob:blob,patched:false};
+  var info=null;
+  offset=segment.dataStart;
+  while(offset<segment.dataEnd){
+   var child=readEbmlElement(view,offset,segment.dataEnd);
+   if(!child)break;
+   if(child.id===0x1549A966){info=child;break}
+   if(child.next<=offset)break;
+   offset=child.next;
+  }
+  if(!info)return {blob:blob,patched:false};
+  var duration=null,timecodeScale=1000000;
+  offset=info.dataStart;
+  while(offset<info.dataEnd){
+   var child=readEbmlElement(view,offset,info.dataEnd);
+   if(!child)break;
+   if(child.id===0x2AD7B1){
+    timecodeScale=0;
+    for(var i=child.dataStart;i<child.dataEnd;i++)timecodeScale=timecodeScale*256+view.getUint8(i);
+   }else if(child.id===0x4489)duration=child;
+   if(child.next<=offset)break;
+   offset=child.next;
+  }
+  if(!duration||!timecodeScale)return {blob:blob,patched:false};
+  var timecodeDuration=Math.max(1,durationMs)*1000000/timecodeScale;
+  if(duration.dataEnd-duration.dataStart===4)view.setFloat32(duration.dataStart,timecodeDuration,false);
+  else if(duration.dataEnd-duration.dataStart===8)view.setFloat64(duration.dataStart,timecodeDuration,false);
+  else return {blob:blob,patched:false};
+  return {blob:new Blob([buffer],{type:blob.type}),patched:true};
+ });
+}
+
+var toggleDevRec=function(){
+ apiPost('/api/devrec',{}).then(function(d){
+  toast(d.msg);$('devRecStat').textContent=d.rec?'设备正在保存 MJPEG...':'已停止';
+  if(d.rec){$('devRecBtn').textContent='停止保存 MJPEG'}else{$('devRecBtn').textContent='开始保存 MJPEG';loadFiles()}
+ });
+}
+
+var loadScript=function(){api('/api/script').then(function(d){$('s-script').value=d.script||''})}
+var saveScript=function(){apiPost('/api/script/save',{script:$('s-script').value}).then(function(){toast('脚本已保存')})}
+var runScript=function(){apiPost('/api/script/run',{}).then(function(d){toast(d.msg||'脚本已执行')})}
+
+var loadOTG=function(){api('/api/otg/get').then(function(d){$('s-otg').value=d.usb?1:0});loadUsbStatus();loadUsbAutomation()}
+var loadUsbStatus=function(){
+ api('/api/usb-status').then(function(d){
+  var h='<div><b>Host</b> '+(d.ready?'已启动':'未启动/当前模式关闭')+'</div>';
+  if(d.error)h+='<div><b>错误</b> '+d.error+'</div>';
+  h+='<div><b>已连接设备数</b> '+d.count+'</div>';
+  if(d.last.address){
+   h+='<div><b>最近事件</b> '+(d.last.connected?'插入':'拔出')+' (地址 '+d.last.address+')</div>';
+   h+='<div><b>VID:PID</b> '+d.last.vid+':'+d.last.pid+'</div>';
+   h+='<div><b>Class/Subclass/Protocol</b> '+d.last.class+'/'+d.last.subclass+'/'+d.last.protocol+'</div>';
+  }else h+='<div>尚未检测到设备</div>';
+  $('usb-status').innerHTML=h;
+ });
+}
+var loadUsbAutomation=function(){
+ api('/api/usb-script').then(function(d){
+  $('s-usb-connect').value=d.connect||'';
+  $('s-usb-disconnect').value=d.disconnect||'';
+ });
+}
+var saveUsbAutomation=function(){
+ apiPost('/api/usb-script',{connect:$('s-usb-connect').value,disconnect:$('s-usb-disconnect').value})
+ .then(function(d){toast(d.msg||'USB 触发脚本已保存')});
+}
+var loadSensor=function(){api('/api/sensor/get').then(function(d){$('s-bri').value=d.bri;$('s-con').value=d.con;$('s-sat').value=d.sat;$('s-wb').value=d.wb})}
+var loadAbout=function(){api('/api/about').then(function(d){
+ $('about-info').innerHTML='固件 ECMV 1.0<br>芯片 '+d.chip+'<br>CPU '+d.cpu+' MHz<br>Flash '+d.flash+'<br>PSRAM '+(d.psram||'无')+'<br>空闲堆 '+d.heap+' bytes<br>运行 '+d.uptime+' 秒'
+})}
+
+var snap=function(){
+ canvas.width=stream.naturalWidth||640;canvas.height=stream.naturalHeight||480;
+ ctx.drawImage(stream,0,0);var a=document.createElement('a');a.href=canvas.toDataURL('image/jpeg');a.download='ecmv_snap_'+Date.now()+'.jpg';a.click();
+}
+
+var toggleRec=function(){
+ var btn=$('recBtn');
+ if(!isRec){
+  canvas.width=stream.naturalWidth||640;canvas.height=stream.naturalHeight||480;ctx.drawImage(stream,0,0);
+  var s=canvas.captureStream(25);recorder=new MediaRecorder(s,{mimeType:'video/webm'});chunks=[];
+  recorder.ondataavailable=function(e){if(e.data.size>0)chunks.push(e.data)};
+  recorder.onstop=function(){
+   isRec=false;btn.textContent='REC';btn.classList.remove('rec-on');
+   s.getTracks().forEach(function(track){track.stop()});
+   if(!chunks.length){toast('无画面数据');return}
+   var raw=new Blob(chunks,{type:'video/webm'}),elapsed=performance.now()-recStartedAt;
+   patchWebmDuration(raw,elapsed).then(function(result){
+    var url=URL.createObjectURL(result.blob),a=document.createElement('a');
+    a.href=url;a.download='ecmv_video_'+Date.now()+'.webm';a.click();
+    setTimeout(function(){URL.revokeObjectURL(url)},60000);
+    if(!result.patched)toast('未找到 WebM 时长字段，已下载原始文件');
+   }).catch(function(){
+    var url=URL.createObjectURL(raw),a=document.createElement('a');
+    a.href=url;a.download='ecmv_video_'+Date.now()+'.webm';a.click();
+    setTimeout(function(){URL.revokeObjectURL(url)},60000);
+    toast('时长修复失败，已下载原始文件');
+   });
+  };
+  drawTimer=setInterval(function(){if(stream.readyState>=2)ctx.drawImage(stream,0,0,canvas.width,canvas.height)},40);
+  recStartedAt=performance.now();recorder.start();isRec=true;btn.textContent='STOP';btn.classList.add('rec-on');
+ }else{
+  clearInterval(drawTimer);recorder.stop();
+ }
+}
+
+setInterval(function(){
+ fetch('/api/status').then(function(r){return r.json()}).then(function(d){
+  $('h-fps').textContent=d.fps||'--';$('h-temp').textContent=d.temp||'--';
+  $('h-ram').textContent=(d.heap/1024).toFixed(0)+'K';
+  $('h-wifi').textContent=d.staConnected?'STA':'AP';
+  $('h-net').textContent=d.staConnected?d.staIP:d.apIP;
+  frameDelay=d.res>=15?500:(d.res>=13?250:100);
+  if($('tp3').classList.contains('active'))loadUsbStatus();
+ }).catch(function(){});
+},3000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// 工具函数
+String jsonEscape(const String &s) {
+    String o;
+    o.reserve(s.length() + 16);
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if (c == '\n') o += "\\n";
+        else if (c == '\r') o += "\\r";
+        else o += c;
+    }
+    return o;
+}
+
+void sendJson(int code, const String &body) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(code, "application/json; charset=utf-8", body);
+}
+
+String getStatusJson() {
+    uint32_t heap = ESP.getFreeHeap();
+    uint32_t tempC = temperatureRead();
+    String j = "{";
+    j += "\"res\":" + String(currentRes);
+    j += ",\"qual\":" + String(currentQual);
+    j += ",\"theme\":" + String(currentTheme);
+    j += ",\"bri\":" + String(currentBri);
+    j += ",\"con\":" + String(currentCon);
+    j += ",\"sat\":" + String(currentSat);
+    j += ",\"wb\":" + String(currentWb);
+    j += ",\"recSeg\":" + String(recSegmentSec);
+    j += ",\"recLoop\":" + String(recLoop ? "true" : "false");
+    j += ",\"apSSID\":\"" + jsonEscape(apSSID) + "\"";
+    j += ",\"apEnabled\":" + String(apEnabled ? "true" : "false");
+    j += ",\"otgAsUsb\":" + String(otgAsUsb ? "true" : "false");
+    j += ",\"heap\":" + String(heap);
+    j += ",\"temp\":" + String(tempC);
+    j += ",\"staConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+    j += ",\"staIP\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")) + "\"";
+    j += ",\"apIP\":\"" + WiFi.softAPIP().toString() + "\"";
+    j += ",\"recording\":" + String(recording ? "true" : "false");
+    j += ",\"frames\":" + String(recFrames);
+    j += ",\"fps\":" + String(recording && (millis() - recStartMs) > 0 ? (recFrames * 1000ULL / (millis() - recStartMs)) : 0);
+    j += "}";
+    return j;
+}
+
+// 摄像头初始化
+bool initCamera() {
+    camConfig.ledc_channel = LEDC_CHANNEL_0;
+    camConfig.ledc_timer = LEDC_TIMER_0;
+    camConfig.pin_d0 = Y2_GPIO_NUM;
+    camConfig.pin_d1 = Y3_GPIO_NUM;
+    camConfig.pin_d2 = Y4_GPIO_NUM;
+    camConfig.pin_d3 = Y5_GPIO_NUM;
+    camConfig.pin_d4 = Y6_GPIO_NUM;
+    camConfig.pin_d5 = Y7_GPIO_NUM;
+    camConfig.pin_d6 = Y8_GPIO_NUM;
+    camConfig.pin_d7 = Y9_GPIO_NUM;
+    camConfig.pin_xclk = XCLK_GPIO_NUM;
+    camConfig.pin_pclk = PCLK_GPIO_NUM;
+    camConfig.pin_vsync = VSYNC_GPIO_NUM;
+    camConfig.pin_href = HREF_GPIO_NUM;
+    camConfig.pin_sscb_sda = SIOD_GPIO_NUM;
+    camConfig.pin_sscb_scl = SIOC_GPIO_NUM;
+    camConfig.pin_pwdn = PWDN_GPIO_NUM;
+    camConfig.pin_reset = RESET_GPIO_NUM;
+    bool highResolution = currentRes >= FRAMESIZE_UXGA;
+    camConfig.xclk_freq_hz = highResolution ? 8000000 : 20000000;
+    camConfig.pixel_format = PIXFORMAT_JPEG;
+    camConfig.frame_size = (framesize_t)currentRes;
+    camConfig.jpeg_quality = currentQual;
+    camConfig.fb_count = highResolution ? 1 : 2;
+    camConfig.fb_location = CAMERA_FB_IN_PSRAM;
+    camConfig.grab_mode = highResolution ? CAMERA_GRAB_WHEN_EMPTY : CAMERA_GRAB_LATEST;
+    esp_err_t err = esp_camera_init(&camConfig);
+    if (err != ESP_OK) return false;
+    sensor = esp_camera_sensor_get();
+    if (sensor) {
+        sensor->set_brightness(sensor, currentBri);
+        sensor->set_contrast(sensor, currentCon);
+        sensor->set_saturation(sensor, currentSat);
+        sensor->set_wb_mode(sensor, currentWb);
+    }
+    return true;
+}
+
+bool isSupportedFrameSize(int size) {
+    switch (size) {
+        case FRAMESIZE_QVGA:
+        case FRAMESIZE_CIF:
+        case FRAMESIZE_HVGA:
+        case FRAMESIZE_VGA:
+        case FRAMESIZE_SVGA:
+        case FRAMESIZE_XGA:
+        case FRAMESIZE_HD:
+        case FRAMESIZE_SXGA:
+        case FRAMESIZE_UXGA:
+        case FRAMESIZE_QXGA:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool applyCameraSettings() {
+    if (!sensor) return false;
+    sensor->set_brightness(sensor, currentBri);
+    sensor->set_contrast(sensor, currentCon);
+    sensor->set_saturation(sensor, currentSat);
+    sensor->set_wb_mode(sensor, currentWb);
+    sensor->set_quality(sensor, currentQual);
+    return true;
+}
+
+fs::FS &mediaStorage() {
+    if (useSD && sdMounted) return SD_MMC;
+    return LittleFS;
+}
+
+bool initSDCard() {
+    if (!SD_MMC.setPins(39, 38, 40)) {
+        Serial.println("[sd] setPins failed");
+        return false;
+    }
+    if (!SD_MMC.begin("/sdcard", true)) {
+        Serial.println("[sd] mount failed");
+        return false;
+    }
+    if (SD_MMC.cardType() == CARD_NONE) {
+        Serial.println("[sd] no card detected");
+        SD_MMC.end();
+        return false;
+    }
+    Serial.println("[sd] mounted (1-bit, CLK=39 CMD=38 D0=40)");
+    return true;
+}
+
+void recordFrame(camera_fb_t *fb) {
+    if (!recording || !recFile) return;
+    recFile.write(fb->buf, fb->len);
+    recFrames++;
+    if (recSegmentSec > 0 && (millis() - recStartMs) >= (uint32_t)recSegmentSec * 1000UL) {
+        recFile.close();
+        recording = false;
+        recPath = "";
+    }
+}
+
+void handleFrame() {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { sendJson(503, "{\"msg\":\"camera frame unavailable\"}"); return; }
+    recordFrame(fb);
+    server.sendHeader("Cache-Control", "no-store");
+    server.setContentLength(fb->len);
+    server.send(200, "image/jpeg", "");
+    server.sendContent((const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+}
+
+// 文件列表
+String listFilesJson() {
+    File root = mediaStorage().open("/");
+    if (!root) return "{\"files\":[]}";
+    String j = "{\"files\":[";
+    bool first = true;
+    File f = root.openNextFile();
+    while (f) {
+        if (!f.isDirectory()) {
+            if (!first) j += ",";
+            first = false;
+            j += "{\"name\":\"" + jsonEscape(String(f.name())) + "\",\"size\":" + String(f.size()) + "}";
+        }
+        f = root.openNextFile();
+    }
+    root.close();
+    j += "]}";
+    return j;
+}
+
+// 文件下载
+void handleDownload() {
+    if (!server.hasArg("f")) { server.send(400, "text/plain", "missing f"); return; }
+    String name = server.arg("f");
+    if (name.indexOf("..") >= 0) { server.send(403, "text/plain", "forbidden"); return; }
+    String path = name.startsWith("/") ? name : "/" + name;
+    File f = mediaStorage().open(path, "r");
+    if (!f) { server.send(404, "text/plain", "not found"); return; }
+    String ct = "application/octet-stream";
+    if (path.endsWith(".jpg") || path.endsWith(".jpeg")) ct = "image/jpeg";
+    else if (path.endsWith(".mjpeg")) ct = "video/x-motion-jpeg";
+    else if (path.endsWith(".avi")) ct = "video/x-msvideo";
+    server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
+    server.streamFile(f, ct);
+    f.close();
+}
+
+// 视频流
+void handleStream() {
+    WiFiClient client = server.client();
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+    client.println("Cache-Control: no-store");
+    client.println("Connection: close");
+    client.println();
+    while (client.connected()) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) { delay(10); continue; }
+        client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+        client.write(fb->buf, fb->len);
+        client.print("\r\n");
+        recordFrame(fb);
+        esp_camera_fb_return(fb);
+        if (!client.connected()) break;
+    }
+}
+
+// API 路由
+void handleApiStatus() { sendJson(200, getStatusJson()); }
+
+void handleApiNet() {
+    String j = "{";
+    j += "\"apOn\":" + String(apEnabled ? "true" : "false");
+    j += ",\"apSSID\":\"" + jsonEscape(apSSID) + "\"";
+    j += ",\"apIP\":\"" + WiFi.softAPIP().toString() + "\"";
+    bool sc = WiFi.status() == WL_CONNECTED;
+    j += ",\"staConnected\":" + String(sc ? "true" : "false");
+    j += ",\"staSSID\":\"" + (sc ? jsonEscape(WiFi.SSID()) : String("")) + "\"";
+    j += ",\"staIP\":\"" + (sc ? WiFi.localIP().toString() : String("")) + "\"";
+    j += ",\"rssi\":" + String(sc ? WiFi.RSSI() : 0);
+    j += ",\"ble\":" + String(bleActive ? "true" : "false");
+    j += "}";
+    sendJson(200, j);
+}
+
+void handleApiFiles() { sendJson(200, listFilesJson()); }
+
+void handleApiStorageGet() {
+    String j = "{\"sdMounted\":";
+    j += sdMounted ? "true" : "false";
+    j += ",\"useSD\":";
+    j += useSD ? "true" : "false";
+    j += ",\"sdPins\":\"CLK=39,CMD=38,D0=40\"}";
+    sendJson(200, j);
+}
+
+void handleApiStorageSet() {
+    String body = server.arg("plain");
+    int p = body.indexOf("\"useSD\":");
+    if (p < 0) { sendJson(400, "{\"ok\":false,\"msg\":\"缺少存储位置\"}"); return; }
+    bool requestedSD = body.substring(p + 8).toInt() != 0;
+    if (requestedSD && !sdMounted) {
+        sendJson(409, "{\"ok\":false,\"msg\":\"未检测到板载 SD 卡\"}");
+        return;
+    }
+    bool previousStorage = useSD;
+    useSD = requestedSD;
+    if (prefs.putBool("useSD", useSD) == 0) {
+        useSD = previousStorage;
+        sendJson(500, "{\"ok\":false,\"msg\":\"存储位置写入失败\"}");
+        return;
+    }
+    sendJson(200, "{\"ok\":true,\"msg\":\"新文件将保存到所选存储位置\"}");
+}
+
+void handleApiDelete() {
+    String body = server.arg("plain");
+    int p = body.indexOf("\"name\":\"");
+    if (p < 0) { sendJson(400, "{\"msg\":\"bad\"}"); return; }
+    int s = p + 8; int e = body.indexOf('"', s);
+    String name = body.substring(s, e);
+    if (name.indexOf("..") >= 0) { sendJson(403, "{\"msg\":\"forbidden\"}"); return; }
+    String path = name.startsWith("/") ? name : "/" + name;
+    bool ok = mediaStorage().remove(path);
+    sendJson(200, ok ? "{\"msg\":\"deleted\"}" : "{\"msg\":\"fail\"}");
+}
+
+void handleApiDeleteAll() {
+    File root = mediaStorage().open("/");
+    File f = root.openNextFile();
+    while (f) {
+        if (!f.isDirectory()) {
+            String p = f.name();
+            if (!p.startsWith("/")) p = "/" + p;
+            mediaStorage().remove(p);
+        }
+        f = root.openNextFile();
+    }
+    root.close();
+    sendJson(200, "{\"msg\":\"all deleted\"}");
+}
+
+void handleApiCam() {
+    String body = server.arg("plain");
+    auto num = [&](const char *key, int def) -> int {
+        int p = body.indexOf(String("\"") + key + "\":");
+        if (p < 0) return def;
+        return body.substring(p + strlen(key) + 3).toInt();
+    };
+    int previousRes = currentRes;
+    int previousQual = currentQual;
+    int previousTheme = currentTheme;
+    int previousBri = currentBri;
+    int previousCon = currentCon;
+    int previousSat = currentSat;
+    int previousWb = currentWb;
+    currentRes = num("res", currentRes);
+    if (!isSupportedFrameSize(currentRes)) {
+        currentRes = previousRes;
+        sendJson(400, "{\"msg\":\"不支持的分辨率\"}");
+        return;
+    }
+    bool resolutionChanged = currentRes != previousRes;
+    currentQual = num("qual", currentQual);
+    currentTheme = num("theme", currentTheme);
+    currentBri = num("bri", currentBri);
+    currentCon = num("con", currentCon);
+    currentSat = num("sat", currentSat);
+    currentWb = num("wb", currentWb);
+    bool cameraApplied;
+    if (resolutionChanged) {
+        esp_camera_deinit();
+        sensor = nullptr;
+        cameraApplied = initCamera();
+    } else {
+        cameraApplied = applyCameraSettings();
+    }
+    if (!cameraApplied) {
+        currentRes = previousRes;
+        currentQual = previousQual;
+        currentTheme = previousTheme;
+        currentBri = previousBri;
+        currentCon = previousCon;
+        currentSat = previousSat;
+        currentWb = previousWb;
+        if (resolutionChanged) {
+            esp_camera_deinit();
+            sensor = nullptr;
+            if (!initCamera()) Serial.println("[camera] failed to restore previous settings");
+        } else {
+            applyCameraSettings();
+        }
+        sendJson(422, "{\"msg\":\"摄像头无法应用该分辨率\"}");
+        return;
+    }
+    prefs.putInt("res", currentRes); prefs.putInt("qual", currentQual);
+    prefs.putInt("theme", currentTheme); prefs.putInt("bri", currentBri);
+    prefs.putInt("con", currentCon); prefs.putInt("sat", currentSat);
+    prefs.putInt("wb", currentWb);
+    sendJson(200, "{\"msg\":\"画面参数已应用\"}");
+}
+
+void handleApiRec() {
+    String body = server.arg("plain");
+    int p = body.indexOf("\"seg\":");
+    if (p >= 0) recSegmentSec = body.substring(p + 6).toInt();
+    recLoop = body.indexOf("\"loop\":true") >= 0;
+    prefs.putInt("recSeg", recSegmentSec);
+    prefs.putBool("recLoop", recLoop);
+    sendJson(200, "{\"msg\":\"录像设置已保存\"}");
+}
+
+void handleApiAp() {
+    String body = server.arg("plain");
+    int p = body.indexOf("\"ssid\":\"");
+    if (p >= 0) {
+        int s = p + 8, e = body.indexOf('"', s);
+        String v = body.substring(s, e);
+        if (v.length()) apSSID = v;
+    }
+    p = body.indexOf("\"pass\":\"");
+    if (p >= 0) {
+        int s = p + 8, e = body.indexOf('"', s);
+        String v = body.substring(s, e);
+        if (v.length() >= 8) apPass = v;
+    }
+    apEnabled = true;
+    prefs.putString("apSSID", apSSID); prefs.putString("apPass", apPass);
+    prefs.putBool("apEnabled", apEnabled);
+    sendJson(200, "{\"msg\":\"已保存，重启后热点配置完全生效\"}");
+}
+
+void handleApiSta() {
+    String body = server.arg("plain");
+    int p = body.indexOf("\"ssid\":\"");
+    if (p < 0) { sendJson(400, "{\"msg\":\"no ssid\"}"); return; }
+    int s = p + 8, e = body.indexOf('"', s);
+    String ssid = body.substring(s, e);
+    p = body.indexOf("\"pass\":\"");
+    String pass = "";
+    if (p >= 0) { s = p + 8; e = body.indexOf('"', s); pass = body.substring(s, e); }
+    staSSID = ssid; staPass = pass;
+    prefs.putString("staSSID", staSSID); prefs.putString("staPass", staPass);
+    WiFi.begin(staSSID.c_str(), staPass.c_str());
+    sendJson(200, "{\"msg\":\"正在连接 \" + jsonEscape(ssid) + \"\"}");
+}
+
+void handleApiSensor() {
+    String body = server.arg("plain");
+    auto num = [&](const char *key, int def) -> int {
+        int p = body.indexOf(String("\"") + key + "\":");
+        if (p < 0) return def;
+        return body.substring(p + strlen(key) + 3).toInt();
+    };
+    int previousBri = currentBri;
+    int previousCon = currentCon;
+    int previousSat = currentSat;
+    int previousWb = currentWb;
+    currentBri = num("bri", currentBri);
+    currentCon = num("con", currentCon);
+    currentSat = num("sat", currentSat);
+    currentWb = num("wb", currentWb);
+    if (!applyCameraSettings()) {
+        currentBri = previousBri;
+        currentCon = previousCon;
+        currentSat = previousSat;
+        currentWb = previousWb;
+        applyCameraSettings();
+        sendJson(503, "{\"msg\":\"摄像头参数应用失败\"}");
+        return;
+    }
+    prefs.putInt("bri", currentBri); prefs.putInt("con", currentCon);
+    prefs.putInt("sat", currentSat); prefs.putInt("wb", currentWb);
+    sendJson(200, "{\"msg\":\"传感器参数已应用\"}");
+}
+
+void handleApiSensorGet() {
+    String j = "{\"bri\":" + String(currentBri) + ",\"con\":" + String(currentCon) +
+               ",\"sat\":" + String(currentSat) + ",\"wb\":" + String(currentWb) + "}";
+    sendJson(200, j);
+}
+
+void handleApiOtg() {
+    String body = server.arg("plain");
+    int p = body.indexOf("\"usb\":");
+    if (p >= 0) otgAsUsb = body.substring(p + 6).toInt() != 0;
+    prefs.putBool("otgUsb", otgAsUsb);
+    sendJson(200, "{\"msg\":\"ok\"}");
+}
+
+void handleApiOtgGet() { sendJson(200, String("{\"usb\":") + (otgAsUsb ? "true" : "false") + "}"); }
+
+void handleApiBle() {
+    String body = server.arg("plain");
+    int p = body.indexOf("\"on\":");
+    int v = p >= 0 ? body.substring(p + 5).toInt() : 0;
+    if (v) {
+        if (!bleActive) {
+            NimBLEDevice::init("ECMV-BLE");
+            bleServer = NimBLEDevice::createServer();
+            bleServer->setCallbacks(&bleConnCallback, false);
+            auto svc = bleServer->createService("FFF0");
+            bleCharRx = svc->createCharacteristic("FFF1", NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+            bleCharRx->setCallbacks(&bleRxCallback);
+            bleCharTx = svc->createCharacteristic("FFF2", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+            svc->start();
+            NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+            adv->addServiceUUID("FFF0");
+            adv->start();
+            bleActive = true;
+        }
+        sendJson(200, "{\"msg\":\"BLE 广播已启动\"}");
+    } else {
+        if (bleActive) { NimBLEDevice::deinit(true); bleActive = false; bleServer = nullptr; bleCharRx = nullptr; }
+        sendJson(200, "{\"msg\":\"BLE 已停止\"}");
+    }
+}
+
+void handleApiScriptGet() {
+    sendJson(200, String("{\"script\":\"") + jsonEscape(String(scriptBuf)) + "\"}");
+}
+
+bool extractJsonString(const String &body, const char *key, String &value, size_t maxLength) {
+    String marker = String("\"") + key + "\":\"";
+    int start = body.indexOf(marker);
+    if (start < 0) return false;
+    start += marker.length();
+    value = "";
+    for (int i = start; i < (int)body.length(); i++) {
+        char c = body[i];
+        if (c == '"') return true;
+        if (c == '\\') {
+            if (++i >= (int)body.length()) return false;
+            char escaped = body[i];
+            if (escaped == 'n') c = '\n';
+            else if (escaped == 'r') c = '\r';
+            else if (escaped == 't') c = '\t';
+            else if (escaped == '"' || escaped == '\\' || escaped == '/') c = escaped;
+            else return false;
+        }
+        if (value.length() >= maxLength) return false;
+        value += c;
+    }
+    return false;
+}
+
+bool validBleMac(const String &mac) {
+    if (mac.length() == 0) return true;
+    if (mac.length() != 17) return false;
+    for (int i = 0; i < 17; i++) {
+        char c = mac[i];
+        if (i == 2 || i == 5 || i == 8 || i == 11 || i == 14) {
+            if (c != ':') return false;
+        } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void handleApiBleScriptGet() {
+    String j = "{\"mac\":\"" + jsonEscape(bleMacFilter) +
+               "\",\"connect\":\"" + jsonEscape(bleConnectScript) +
+               "\",\"disconnect\":\"" + jsonEscape(bleDisconnectScript) + "\"}";
+    sendJson(200, j);
+}
+
+void handleApiBleScriptSave() {
+    String body = server.arg("plain");
+    String mac, connectScript, disconnectScript;
+    if (!extractJsonString(body, "mac", mac, 17) ||
+        !extractJsonString(body, "connect", connectScript, 1024) ||
+        !extractJsonString(body, "disconnect", disconnectScript, 1024)) {
+        sendJson(400, "{\"msg\":\"脚本格式错误或内容超过 1024 字节\"}");
+        return;
+    }
+    mac.trim();
+    if (!validBleMac(mac)) {
+        sendJson(400, "{\"msg\":\"MAC 地址格式应为 AA:BB:CC:DD:EE:FF，或留空\"}");
+        return;
+    }
+    File connectFile = LittleFS.open("/ble_connect.txt", "w");
+    if (!connectFile) { sendJson(500, "{\"msg\":\"无法保存连接脚本\"}"); return; }
+    size_t connectWritten = connectFile.print(connectScript);
+    connectFile.close();
+    if (connectWritten != connectScript.length()) {
+        sendJson(500, "{\"msg\":\"连接脚本写入不完整\"}");
+        return;
+    }
+    File disconnectFile = LittleFS.open("/ble_disconnect.txt", "w");
+    if (!disconnectFile) { sendJson(500, "{\"msg\":\"无法保存断开脚本\"}"); return; }
+    size_t disconnectWritten = disconnectFile.print(disconnectScript);
+    disconnectFile.close();
+    if (disconnectWritten != disconnectScript.length()) {
+        sendJson(500, "{\"msg\":\"断开脚本写入不完整\"}");
+        return;
+    }
+    if (prefs.putString("bleMac", mac) == 0) {
+        sendJson(500, "{\"msg\":\"MAC 筛选写入失败\"}");
+        return;
+    }
+    bleConnectScript = connectScript;
+    bleDisconnectScript = disconnectScript;
+    bleMacFilter = mac;
+    sendJson(200, "{\"msg\":\"蓝牙触发脚本已保存\"}");
+}
+
+void handleApiUsbStatus() {
+    UsbTriggerEvent event;
+    uint8_t count;
+    portENTER_CRITICAL(&usbStatusMux);
+    event = lastUsbEvent;
+    count = usbDeviceCount;
+    portEXIT_CRITICAL(&usbStatusMux);
+    String error = jsonEscape(usbHostError);
+    char json[384];
+    snprintf(json, sizeof(json),
+             "{\"ready\":%s,\"error\":\"%s\",\"count\":%u,\"last\":{\"connected\":%s,\"address\":%u,"
+             "\"vid\":\"%04X\",\"pid\":\"%04X\",\"class\":\"0x%02X\","
+             "\"subclass\":\"0x%02X\",\"protocol\":\"0x%02X\"}}",
+             usbHostReady ? "true" : "false",
+             error.c_str(),
+             count,
+             event.connected ? "true" : "false",
+             event.address,
+             event.vendorId,
+             event.productId,
+             event.deviceClass,
+             event.deviceSubclass,
+             event.deviceProtocol);
+    sendJson(200, String(json));
+}
+
+void handleApiUsbScriptGet() {
+    String j = "{\"connect\":\"" + jsonEscape(usbConnectScript) +
+               "\",\"disconnect\":\"" + jsonEscape(usbDisconnectScript) + "\"}";
+    sendJson(200, j);
+}
+
+void handleApiUsbScriptSave() {
+    String body = server.arg("plain");
+    String connectScript, disconnectScript;
+    if (!extractJsonString(body, "connect", connectScript, 1024) ||
+        !extractJsonString(body, "disconnect", disconnectScript, 1024)) {
+        sendJson(400, "{\"msg\":\"脚本格式错误或内容超过 1024 字节\"}");
+        return;
+    }
+    File connectFile = LittleFS.open("/usb_connect.txt", "w");
+    if (!connectFile) { sendJson(500, "{\"msg\":\"无法保存 USB 插入脚本\"}"); return; }
+    size_t connectWritten = connectFile.print(connectScript);
+    connectFile.close();
+    if (connectWritten != connectScript.length()) {
+        sendJson(500, "{\"msg\":\"USB 插入脚本写入不完整\"}");
+        return;
+    }
+    File disconnectFile = LittleFS.open("/usb_disconnect.txt", "w");
+    if (!disconnectFile) { sendJson(500, "{\"msg\":\"无法保存 USB 拔出脚本\"}"); return; }
+    size_t disconnectWritten = disconnectFile.print(disconnectScript);
+    disconnectFile.close();
+    if (disconnectWritten != disconnectScript.length()) {
+        sendJson(500, "{\"msg\":\"USB 拔出脚本写入不完整\"}");
+        return;
+    }
+    usbConnectScript = connectScript;
+    usbDisconnectScript = disconnectScript;
+    sendJson(200, "{\"msg\":\"USB 插拔脚本已保存\"}");
+}
+
+void handleApiScriptSave() {
+    String body = server.arg("plain");
+    int p = body.indexOf("\"script\":\"");
+    if (p < 0) { sendJson(400, "{\"msg\":\"bad\"}"); return; }
+    int s = p + 10;
+    String out;
+    for (int i = s; i < (int)body.length(); i++) {
+        char c = body[i];
+        if (c == '\\' && i + 1 < (int)body.length()) {
+            char n = body[i + 1];
+            if (n == 'n') { out += '\n'; i++; }
+            else if (n == '"') { out += '"'; i++; }
+            else if (n == '\\') { out += '\\'; i++; }
+            else out += c;
+        } else if (c == '"') break;
+        else out += c;
+    }
+    if (out.length() >= SCRIPT_MAX) out = out.substring(0, SCRIPT_MAX - 1);
+    strncpy(scriptBuf, out.c_str(), SCRIPT_MAX - 1);
+    scriptBuf[SCRIPT_MAX - 1] = 0;
+    File f = LittleFS.open("/script.txt", "w");
+    if (f) { f.print(scriptBuf); f.close(); }
+    sendJson(200, "{\"msg\":\"脚本已保存\"}");
+}
+
+bool isScriptGpioAllowed(int pin) {
+    switch (pin) {
+        case 1: case 2: case 3: case 14: case 21:
+        case 41: case 42: case 47: case 48:
+            return true;
+        default:
+            return false;
+    }
+}
+
+int executeScriptText(const String &script) {
+    String line;
+    int executed = 0;
+    for (int i = 0; i <= (int)script.length(); i++) {
+        char c = i < (int)script.length() ? script[i] : 0;
+        if (c == '\n' || c == '\r' || c == 0) {
+            line.trim();
+            if (line.length() == 0) { line = ""; continue; }
+            if (line.startsWith("GPIO=")) {
+                String rest = line.substring(5);
+                int colon = rest.indexOf(':');
+                if (colon > 0) {
+                    int pin = rest.substring(0, colon).toInt();
+                    int lvl = rest.substring(colon + 1).toInt();
+                    if (isScriptGpioAllowed(pin) && (lvl == 0 || lvl == 1)) {
+                        pinMode(pin, OUTPUT);
+                        digitalWrite(pin, lvl ? HIGH : LOW);
+                        executed++;
+                    }
+                }
+            } else if (line.startsWith("DELAY=")) {
+                int ms = line.substring(6).toInt();
+                if (ms > 0 && ms < 30000) { delay(ms); executed++; }
+            }
+            line = "";
+        } else line += c;
+    }
+    return executed;
+}
+
+void handleApiScriptRun() {
+    int executed = executeScriptText(String(scriptBuf));
+    if (recording) { recording = false; if (recFile) recFile.close(); }
+    String msg = "执行 " + String(executed) + " 条指令";
+    sendJson(200, "{\"msg\":\"" + msg + "\"}");
+}
+
+void processBleTriggers() {
+    if (!bleTriggerQueue) return;
+    BleTriggerEvent event;
+    while (xQueueReceive(bleTriggerQueue, &event, 0) == pdTRUE) {
+        String address(event.address);
+        if (bleMacFilter.length() && !address.equalsIgnoreCase(bleMacFilter)) continue;
+        const String &script = event.connected ? bleConnectScript : bleDisconnectScript;
+        int executed = executeScriptText(script);
+        Serial.printf("[ble] %s trigger from %s; %d commands\n",
+                      event.connected ? "connect" : "disconnect",
+                      event.address, executed);
+    }
+}
+
+void processUsbTriggers() {
+    if (!usbTriggerQueue) return;
+    UsbTriggerEvent event;
+    while (xQueueReceive(usbTriggerQueue, &event, 0) == pdTRUE) {
+        const String &script = event.connected ? usbConnectScript : usbDisconnectScript;
+        int executed = executeScriptText(script);
+        Serial.printf("[usb] %s trigger VID=%04X PID=%04X class=%02X; %d commands\n",
+                      event.connected ? "connect" : "disconnect",
+                      event.vendorId, event.productId, event.deviceClass, executed);
+    }
+}
+
+void handleApiDevRec() {
+    if (!recording) {
+        if (useSD && !sdMounted) { sendJson(503, "{\"msg\":\"未检测到板载 SD 卡\",\"rec\":false}"); return; }
+        recPath = "/rec_" + String(millis()) + ".mjpeg";
+        recFile = mediaStorage().open(recPath, "w");
+        if (!recFile) { sendJson(500, "{\"msg\":\"无法创建文件\",\"rec\":false}"); return; }
+        recording = true; recFrames = 0; recStartMs = millis();
+        sendJson(200, "{\"msg\":\"开始保存 MJPEG\",\"rec\":true}");
+    } else {
+        recording = false;
+        if (recFile) recFile.close();
+        sendJson(200, "{\"msg\":\"已停止，保存 " + String(recFrames) + " 帧\",\"rec\":false}");
+    }
+}
+
+void handleApiAbout() {
+    String j = "{";
+    j += "\"chip\":\"" + String(ESP.getChipModel()) + "\"";
+    j += ",\"cpu\":" + String(ESP.getCpuFreqMHz());
+    j += ",\"flash\":" + String(ESP.getFlashChipSize() / (1024 * 1024)) + "MB";
+    j += ",\"psram\":\"" + String(psramFound() ? String(ESP.getPsramSize() / (1024 * 1024)) + "MB" : "无") + "\"";
+    j += ",\"heap\":" + String(ESP.getFreeHeap());
+    j += ",\"uptime\":" + String(millis() / 1000);
+    j += "}";
+    sendJson(200, j);
+}
+
+// 启动
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("[boot] setup started");
+
+    prefs.begin("ecmv", false);
+    int settingsVersion = prefs.getInt("settingsVersion", 0);
+    bool hasSavedResolution = prefs.isKey("res");
+    currentRes = prefs.getInt("res", FRAMESIZE_SVGA);
+    if (settingsVersion == 0) {
+        if (hasSavedResolution) {
+            switch (currentRes) {
+                case 8: currentRes = FRAMESIZE_VGA; break;
+                case 9: currentRes = FRAMESIZE_SVGA; break;
+                case 10: currentRes = FRAMESIZE_XGA; break;
+                case 11: currentRes = FRAMESIZE_HD; break;
+            }
+        }
+        prefs.putInt("res", currentRes);
+        prefs.putInt("settingsVersion", 1);
+    }
+    currentQual = prefs.getInt("qual", 12);
+    currentTheme = prefs.getInt("theme", 0);
+    currentBri = prefs.getInt("bri", 0);
+    currentCon = prefs.getInt("con", 0);
+    currentSat = prefs.getInt("sat", 0);
+    currentWb = prefs.getInt("wb", 0);
+    recSegmentSec = prefs.getInt("recSeg", 30);
+    recLoop = prefs.getBool("recLoop", true);
+    useSD = prefs.getBool("useSD", false);
+    apSSID = prefs.getString("apSSID", "ECMV");
+    apPass = prefs.getString("apPass", "ecmv123456");
+    apEnabled = true;
+    staSSID = prefs.getString("staSSID", "");
+    staPass = prefs.getString("staPass", "");
+    otgAsUsb = prefs.getBool("otgUsb", true);
+    LittleFS.begin(true);
+    sdMounted = initSDCard();
+    if (useSD && !sdMounted) {
+        useSD = false;
+        prefs.putBool("useSD", false);
+        Serial.println("[sd] selected card unavailable; using LittleFS");
+    }
+    File sf = LittleFS.open("/script.txt", "r");
+    if (sf) { size_t n = sf.readBytes(scriptBuf, SCRIPT_MAX - 1); scriptBuf[n] = 0; sf.close(); }
+    bleMacFilter = prefs.getString("bleMac", "");
+    File bleConnectFile = LittleFS.open("/ble_connect.txt", "r");
+    if (bleConnectFile) { bleConnectScript = bleConnectFile.readString(); bleConnectFile.close(); }
+    File bleDisconnectFile = LittleFS.open("/ble_disconnect.txt", "r");
+    if (bleDisconnectFile) { bleDisconnectScript = bleDisconnectFile.readString(); bleDisconnectFile.close(); }
+    File usbConnectFile = LittleFS.open("/usb_connect.txt", "r");
+    if (usbConnectFile) { usbConnectScript = usbConnectFile.readString(); usbConnectFile.close(); }
+    File usbDisconnectFile = LittleFS.open("/usb_disconnect.txt", "r");
+    if (usbDisconnectFile) { usbDisconnectScript = usbDisconnectFile.readString(); usbDisconnectFile.close(); }
+    bleTriggerQueue = xQueueCreate(4, sizeof(BleTriggerEvent));
+    if (!bleTriggerQueue) Serial.println("[ble] trigger queue allocation failed");
+
+    if (otgAsUsb) {
+        initUsbHost();
+    } else {
+        usbHostError = "USB Host 已关闭";
+        pinMode(OTG_DP_PIN, OUTPUT);
+        pinMode(OTG_DM_PIN, OUTPUT);
+        digitalWrite(OTG_DP_PIN, LOW);
+        digitalWrite(OTG_DM_PIN, LOW);
+    }
+
+    Serial.println("[boot] initializing camera");
+    bool cameraStarted = initCamera();
+    if (!cameraStarted && currentRes != FRAMESIZE_SVGA) {
+        Serial.println("[boot] requested resolution unavailable; retrying SVGA");
+        currentRes = FRAMESIZE_SVGA;
+        prefs.putInt("res", currentRes);
+        cameraStarted = initCamera();
+    }
+    Serial.printf("[boot] camera %s\n", cameraStarted ? "started" : "failed");
+
+    Serial.println("[boot] starting WiFi AP");
+    WiFi.mode(WIFI_AP_STA);
+    bool apStarted = WiFi.softAP(apSSID.c_str(), apPass.c_str());
+    Serial.printf("AP %s: %s, IP: %s\n",
+                  apStarted ? "started" : "failed",
+                  apSSID.c_str(),
+                  WiFi.softAPIP().toString().c_str());
+    if (staSSID.length()) WiFi.begin(staSSID.c_str(), staPass.c_str());
+
+    server.on("/", []() {
+        server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+        server.send_P(200, "text/html", INDEX_HTML);
+    });
+    server.on("/frame", handleFrame);
+    server.on("/stream", handleStream);
+    server.on("/download", handleDownload);
+    server.on("/api/status", handleApiStatus);
+    server.on("/api/net", handleApiNet);
+    server.on("/api/files", handleApiFiles);
+    server.on("/api/storage", handleApiStorageGet);
+    server.on("/api/storage", HTTP_POST, handleApiStorageSet);
+    server.on("/api/delete", HTTP_POST, handleApiDelete);
+    server.on("/api/deleteall", HTTP_POST, handleApiDeleteAll);
+    server.on("/api/cam", HTTP_POST, handleApiCam);
+    server.on("/api/rec", HTTP_POST, handleApiRec);
+    server.on("/api/ap", HTTP_POST, handleApiAp);
+    server.on("/api/sta", HTTP_POST, handleApiSta);
+    server.on("/api/sensor", HTTP_POST, handleApiSensor);
+    server.on("/api/sensor/get", handleApiSensorGet);
+    server.on("/api/otg", HTTP_POST, handleApiOtg);
+    server.on("/api/otg/get", handleApiOtgGet);
+    server.on("/api/ble", HTTP_POST, handleApiBle);
+    server.on("/api/ble-script", handleApiBleScriptGet);
+    server.on("/api/ble-script", HTTP_POST, handleApiBleScriptSave);
+    server.on("/api/usb-status", handleApiUsbStatus);
+    server.on("/api/usb-script", handleApiUsbScriptGet);
+    server.on("/api/usb-script", HTTP_POST, handleApiUsbScriptSave);
+    server.on("/api/script", handleApiScriptGet);
+    server.on("/api/script/save", HTTP_POST, handleApiScriptSave);
+    server.on("/api/script/run", HTTP_POST, handleApiScriptRun);
+    server.on("/api/devrec", HTTP_POST, handleApiDevRec);
+    server.on("/api/about", handleApiAbout);
+    server.begin();
+    Serial.println("[boot] web server started");
+}
+
+void loop() {
+    server.handleClient();
+    processBleTriggers();
+    processUsbTriggers();
+    if (bleActive && bleServer && !bleServer->getConnectedCount()) {
+        // 保持广播
+    }
+    delay(1);
+}
