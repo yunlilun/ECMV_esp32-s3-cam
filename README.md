@@ -1,6 +1,6 @@
 # ECMV ESP32-S3 Camera Monitor
 
-说明文档 / Multi-language Documentation / 多言語ドキュメント / 다국어 문서 / Многоязычная документация
+说明文档
 
 ---
 
